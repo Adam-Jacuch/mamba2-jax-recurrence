@@ -317,7 +317,7 @@ class Mamba2Mixer(nnx.Module):
         self.chunk_size = cfg.chunk_size
         self.dt_min, self.dt_max = cfg.time_step_limit
         self.act = ACT2FN[cfg.hidden_act]
-        self.recursive_depth = cfg.recursive_depth  # Added for N-step unrolling
+        self.recursive_depth = cfg.recursive_depth  
 
         # Input projection
         proj_size = 2 * (self.intermediate_size + self.ssm_state_size) + self.num_heads
@@ -333,7 +333,7 @@ class Mamba2Mixer(nnx.Module):
         floor = cfg.time_step_floor
         dt_init = jnp.exp(jax.random.uniform(key, (cfg.num_heads,)) * (jnp.log(high) - jnp.log(low)) + jnp.log(low))
         dt_init = jnp.maximum(dt_init, floor)
-        self.dt_bias = nnx.Param(dt_init + jnp.log(-jnp.expm1(-dt_init)))  # inverse softplus
+        self.dt_bias = nnx.Param(dt_init + jnp.log(-jnp.expm1(-dt_init)))  
 
         key = rngs.params()
         A_low, A_high = cfg.A_initializer_range
@@ -342,12 +342,16 @@ class Mamba2Mixer(nnx.Module):
 
         self.D = nnx.Param(jnp.ones((cfg.num_heads,)))
 
-        # Internal norms
+        # Base Internal norm
         self.norm = RMSNorm(self.intermediate_size, eps=1e-5, gate_residual=True, rngs=rngs)
         
-        # --- NEW: Step Norm for Recursive Stability ---
-        # Mirrors the `prev_norm` from ResLM to prevent variance explosion during recursive unrolling
+        # --- NEW: ResLM-style Recursive Stabilization Parameters ---
+        # 1. Step Norm: Prevents the D_residual from exploding variance across multiple hops
         self.step_norm = RMSNorm(self.intermediate_size, eps=1e-5, rngs=rngs)
+        
+        # 2. Accumulation Gates: Allows the model to learn how to blend the refinements
+        self.out_gate = nnx.Param(jnp.zeros((self.intermediate_size,)))
+        self.v_gate = nnx.Param(jnp.zeros((self.intermediate_size,)))
 
         self.out_proj = nnx.Linear(self.intermediate_size, cfg.hidden_size, use_bias=cfg.use_bias, rngs=rngs)
 
@@ -375,7 +379,7 @@ class Mamba2Mixer(nnx.Module):
             axis=-1,
         )
 
-        # 2) Depthwise causal convolution with state caching (Computed ONCE)
+        # 2) Depthwise causal convolution (Computed ONCE)
         xBC, new_conv_state = self.conv1d(xBC, conv_state=conv_state)
         xBC = self.act(xBC)
         x, B_t, C_t = jnp.split(xBC, [self.intermediate_size, self.intermediate_size + self.ssm_state_size], axis=-1)
@@ -387,20 +391,27 @@ class Mamba2Mixer(nnx.Module):
         B_exp = jnp.broadcast_to(jnp.expand_dims(B_t, 2), (B_size, L, self.num_heads, self.ssm_state_size))
         C_exp = jnp.broadcast_to(jnp.expand_dims(C_t, 2), (B_size, L, self.num_heads, self.ssm_state_size))
 
-        current_x = x.reshape(B_size, L, -1, self.head_dim)
+        # Setup accumulators
+        v = x.reshape(B_size, L, -1, self.head_dim)
+        out_accum = jnp.zeros_like(v)
         final_ssm_state = None
 
-        # Iteratively refine the representation through the static routing map N times
+        # Pre-calculate gates (Sigmoid forces values between 0 and 1)
+        og = jax.nn.sigmoid(self.out_gate[:]).reshape(1, 1, -1, self.head_dim)
+        vg = jax.nn.sigmoid(self.v_gate[:]).reshape(1, 1, -1, self.head_dim)
+
+        # Iteratively refine the representation
         for step_idx in range(self.recursive_depth):
             
-            # --- NEW: Apply Step Norm to prevent D_residual explosion on N > 1 ---
-            if step_idx > 0:
-                flat_x = current_x.reshape(B_size, L, -1)
-                normed_x = self.step_norm(flat_x)
-                current_x = normed_x.reshape(B_size, L, -1, self.head_dim)
+            # For N > 1, we MUST normalize the accumulated state to prevent variance explosion
+            if step_idx == 0:
+                current_v = v
+            else:
+                flat_v = v.reshape(B_size, L, -1)
+                current_v = self.step_norm(flat_v).reshape(B_size, L, -1, self.head_dim)
 
-            current_x, step_ssm_state = ssd_forward(
-                x=current_x,
+            fetched, step_ssm_state = ssd_forward(
+                x=current_v,
                 dt=dt,
                 A=A,
                 B_mat=B_exp,
@@ -415,7 +426,17 @@ class Mamba2Mixer(nnx.Module):
             )
             final_ssm_state = step_ssm_state
 
-        y = current_x.reshape(B_size, L, -1)
+            # --- THE RESLM ACCUMULATION LOGIC ---
+            if step_idx == 0:
+                # First pass sets the baseline (If N=1, it ends here identically to standard Mamba-2)
+                out_accum = fetched
+                v = fetched
+            else:
+                # Subsequent passes accumulate residuals securely via the learned gates
+                out_accum = out_accum + fetched * og
+                v = v + fetched * vg
+
+        y = out_accum.reshape(B_size, L, -1)
 
         # 4) Residual gate normalization (Computed ONCE)
         y = self.norm(y, residual=z)
@@ -424,7 +445,7 @@ class Mamba2Mixer(nnx.Module):
 
         # 5) Output projection (Computed ONCE)
         return self.out_proj(y), new_conv_state, final_ssm_state
-
+        
 
 class Mamba2Block(nnx.Module):
     """Single Mamba2 block with pre-norm and residual connection."""
