@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Mamba2 JAX/Flax NNX Implementation.
+"""Mamba2 JAX/Flax NNX Implementation with Recursive Depth.
 
-A pure JAX/Flax implementation of the Mamba2 architecture using the State Space Duality (SSD) mechanism.
+A pure JAX/Flax implementation of the Mamba2 architecture using the State Space Duality (SSD) mechanism,
+augmented with Recursive Depth (N-step iterative routing).
 Reference: "Transformers are SSMs: Generalized Models and Efficient Algorithms Through Structured State Space Duality"
 Paper: https://arxiv.org/abs/2405.21060
 """
@@ -48,6 +49,7 @@ class Mamba2Config:
     expand: int = 2
     conv_kernel: int = 4
     num_hidden_layers: int = 24
+    recursive_depth: int = 1  # Added: N-step recursive routing parameter
     layer_norm_epsilon: float = 1e-5
 
     use_bias: bool = False
@@ -315,6 +317,7 @@ class Mamba2Mixer(nnx.Module):
         self.chunk_size = cfg.chunk_size
         self.dt_min, self.dt_max = cfg.time_step_limit
         self.act = ACT2FN[cfg.hidden_act]
+        self.recursive_depth = cfg.recursive_depth  # Added for N-step unrolling
 
         # Input projection
         proj_size = 2 * (self.intermediate_size + self.ssm_state_size) + self.num_heads
@@ -352,7 +355,7 @@ class Mamba2Mixer(nnx.Module):
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         B_size, L, _ = hidden_states.shape
 
-        # 1) Parallel projection
+        # 1) Parallel projection (Computed ONCE)
         zxbcdt = self.in_proj(hidden_states)
         d_mlp = (zxbcdt.shape[-1] - 2 * self.intermediate_size - 2 * self.ssm_state_size - self.num_heads) // 2
 
@@ -367,41 +370,48 @@ class Mamba2Mixer(nnx.Module):
             axis=-1,
         )
 
-        # 2) Depthwise causal convolution with state caching
+        # 2) Depthwise causal convolution with state caching (Computed ONCE)
         xBC, new_conv_state = self.conv1d(xBC, conv_state=conv_state)
         xBC = self.act(xBC)
         x, B_t, C_t = jnp.split(xBC, [self.intermediate_size, self.intermediate_size + self.ssm_state_size], axis=-1)
 
-        # 3) SSD forward with state caching
+        # 3) SSD Recursive Routing Loop
         init_state = ssm_state[:, None, ...] if ssm_state is not None else None
         A = -jnp.exp(self.A_log[:].astype(jnp.float32))
 
         B_exp = jnp.broadcast_to(jnp.expand_dims(B_t, 2), (B_size, L, self.num_heads, self.ssm_state_size))
         C_exp = jnp.broadcast_to(jnp.expand_dims(C_t, 2), (B_size, L, self.num_heads, self.ssm_state_size))
 
-        y, new_ssm_state = ssd_forward(
-            x=x.reshape(B_size, L, -1, self.head_dim),
-            dt=dt,
-            A=A,
-            B_mat=B_exp,
-            C_mat=C_exp,
-            chunk_size=self.chunk_size,
-            D=self.D[:],
-            dt_bias=self.dt_bias[:],
-            dt_min=self.dt_min,
-            dt_max=self.dt_max,
-            initial_states=init_state,
-            return_final_states=True,
-        )
-        y = y.reshape(B_size, L, -1)
+        current_x = x.reshape(B_size, L, -1, self.head_dim)
+        final_ssm_state = None
 
-        # 4) Residual gate normalization
+        # Iteratively refine the representation through the static routing map N times
+        for _ in range(self.recursive_depth):
+            current_x, step_ssm_state = ssd_forward(
+                x=current_x,
+                dt=dt,
+                A=A,
+                B_mat=B_exp,
+                C_mat=C_exp,
+                chunk_size=self.chunk_size,
+                D=self.D[:],
+                dt_bias=self.dt_bias[:],
+                dt_min=self.dt_min,
+                dt_max=self.dt_max,
+                initial_states=init_state,
+                return_final_states=True,
+            )
+            final_ssm_state = step_ssm_state
+
+        y = current_x.reshape(B_size, L, -1)
+
+        # 4) Residual gate normalization (Computed ONCE)
         y = self.norm(y, residual=z)
         if d_mlp > 0:
             y = jnp.concatenate([self.act(z0) * x0, y], axis=-1)
 
-        # 5) Output projection
-        return self.out_proj(y), new_conv_state, new_ssm_state
+        # 5) Output projection (Computed ONCE)
+        return self.out_proj(y), new_conv_state, final_ssm_state
 
 
 class Mamba2Block(nnx.Module):
@@ -443,6 +453,7 @@ class Mamba2Model(nnx.Module):
         inputs_embeds: jnp.ndarray | None = None,
         cache: Mamba2Cache | None = None,
         output_hidden_states: bool = False,
+        use_checkpointing: bool = False,  # Added checkpointing flag
     ) -> dict[str, jnp.ndarray | Mamba2Cache | list[jnp.ndarray] | None]:
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds")
@@ -466,7 +477,11 @@ class Mamba2Model(nnx.Module):
         new_ssm_states = []
 
         for layer, conv_state, ssm_state in zip(self.layers, conv_states, ssm_states):
-            hidden_states, new_conv_state, new_ssm_state = layer(
+            
+            # Apply NNX Gradient Checkpointing if requested to secure O(L+N) scaling
+            layer_fn = nnx.remat(layer) if use_checkpointing else layer
+            
+            hidden_states, new_conv_state, new_ssm_state = layer_fn(
                 hidden_states, conv_state=conv_state, ssm_state=ssm_state
             )
             new_conv_states.append(new_conv_state)
@@ -505,8 +520,9 @@ class Mamba2ForCausalLM(nnx.Module):
         input_ids: jnp.ndarray,
         labels: jnp.ndarray | None = None,
         cache: Mamba2Cache | None = None,
+        use_checkpointing: bool = False, # Pass checkpoint flag downwards
     ) -> dict[str, jnp.ndarray | Mamba2Cache | None]:
-        backbone_outputs = self.backbone(input_ids=input_ids, cache=cache)
+        backbone_outputs = self.backbone(input_ids=input_ids, cache=cache, use_checkpointing=use_checkpointing)
         hidden_states = backbone_outputs["last_hidden_state"]
 
         if self.cfg.tie_word_embeddings:
@@ -558,6 +574,7 @@ class Mamba2Forecaster(nnx.Module):
         headdim: int = 64,
         d_conv: int = 4,
         chunk_size: int = 256,
+        recursive_depth: int = 1, # Added to support N in forecaster API
         *,
         rngs: nnx.Rngs,
     ):
@@ -573,15 +590,16 @@ class Mamba2Forecaster(nnx.Module):
             conv_kernel=d_conv,
             chunk_size=chunk_size,
             num_hidden_layers=n_layers,
+            recursive_depth=recursive_depth,
         )
         self.mamba2 = Mamba2Model(cfg, rngs=rngs)
         self.output_proj = nnx.Linear(d_model, output_dim * forecast_horizon, rngs=rngs)
 
     @jax.named_scope("mamba2_forecaster")
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, use_checkpointing: bool = False) -> jnp.ndarray:
         """Forward pass. Input: (batch, seq_len, input_dim) -> Output: (batch, forecast_horizon, output_dim)."""
         x_proj = self.input_proj(x)
-        outputs = self.mamba2(input_ids=None, inputs_embeds=x_proj)
+        outputs = self.mamba2(input_ids=None, inputs_embeds=x_proj, use_checkpointing=use_checkpointing)
         last_hidden = outputs["last_hidden_state"][:, -1, :]
         out = self.output_proj(last_hidden)
         return out.reshape(x.shape[0], self.forecast_horizon, self.output_dim)
@@ -593,6 +611,7 @@ def forward(
     input_ids: jnp.ndarray,
     labels: jnp.ndarray | None = None,
     cache: Mamba2Cache | None = None,
+    use_checkpointing: bool = False, # Pass checkpoint flag down
 ):
     """JIT-compiled forward pass for Mamba2ForCausalLM with optional caching."""
-    return model(input_ids, labels, cache)
+    return model(input_ids, labels, cache, use_checkpointing=use_checkpointing)
