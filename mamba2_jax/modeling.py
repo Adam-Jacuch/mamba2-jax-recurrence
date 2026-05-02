@@ -345,12 +345,13 @@ class Mamba2Mixer(nnx.Module):
         # Base Internal norm
         self.norm = RMSNorm(self.intermediate_size, eps=1e-5, gate_residual=True, rngs=rngs)
         
-        # --- NEW: Zero-Init Gating & Non-Linearity ---
-        # 1. Step Norm: Breaks the linear collapse and resets variance between hops
-        self.step_norm = RMSNorm(self.intermediate_size, eps=1e-5, rngs=rngs)
+        # --- NEW: Unbounded Variance with Sane Defaults ---
+        # Instead of strictly forcing variance to 1.0 (which amplifies noise on "quiet" steps),
+        # we use a learned LayerScale initialized to 1/N. This prevents the D-residual 
+        # from exploding while allowing the model to naturally decay or amplify the signal.
+        self.step_scale = nnx.Param(jnp.full((self.num_heads, self.head_dim), 1.0 / self.recursive_depth))
         
-        # 2. Accumulation Gates: Initialized strictly to ZERO. 
-        # This guarantees N>1 acts exactly like N=1 at initialization.
+        # Accumulation Gates: Initialized strictly to ZERO. 
         self.out_gate = nnx.Param(jnp.zeros((self.num_heads, self.head_dim)))
         self.v_gate = nnx.Param(jnp.zeros((self.num_heads, self.head_dim)))
 
@@ -407,9 +408,9 @@ class Mamba2Mixer(nnx.Module):
             if step_idx == 0:
                 current_v = v
             else:
-                # Break linearity and normalize variance!
-                flat_v = v.reshape(B_size, L, -1)
-                current_v = self.step_norm(flat_v).reshape(B_size, L, self.num_heads, self.head_dim)
+                # Break linearity and safely bound variance without a hard ceiling
+                step_scale = self.step_scale[:].reshape(1, 1, self.num_heads, self.head_dim)
+                current_v = v * step_scale
 
             fetched, step_ssm_state = ssd_forward(
                 x=current_v,
