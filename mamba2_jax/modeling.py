@@ -342,8 +342,13 @@ class Mamba2Mixer(nnx.Module):
 
         self.D = nnx.Param(jnp.ones((cfg.num_heads,)))
 
-        # Internal norm and output projection
+        # Internal norms
         self.norm = RMSNorm(self.intermediate_size, eps=1e-5, gate_residual=True, rngs=rngs)
+        
+        # --- NEW: Step Norm for Recursive Stability ---
+        # Mirrors the `prev_norm` from ResLM to prevent variance explosion during recursive unrolling
+        self.step_norm = RMSNorm(self.intermediate_size, eps=1e-5, rngs=rngs)
+
         self.out_proj = nnx.Linear(self.intermediate_size, cfg.hidden_size, use_bias=cfg.use_bias, rngs=rngs)
 
     @jax.named_scope("mamba2_mixer")
@@ -386,7 +391,14 @@ class Mamba2Mixer(nnx.Module):
         final_ssm_state = None
 
         # Iteratively refine the representation through the static routing map N times
-        for _ in range(self.recursive_depth):
+        for step_idx in range(self.recursive_depth):
+            
+            # --- NEW: Apply Step Norm to prevent D_residual explosion on N > 1 ---
+            if step_idx > 0:
+                flat_x = current_x.reshape(B_size, L, -1)
+                normed_x = self.step_norm(flat_x)
+                current_x = normed_x.reshape(B_size, L, -1, self.head_dim)
+
             current_x, step_ssm_state = ssd_forward(
                 x=current_x,
                 dt=dt,
